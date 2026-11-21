@@ -1,22 +1,56 @@
-// Shopping Sessions pipeline: rules.md implemented in one pass-oriented Rust program.
-// Stages: read inputs (mmap) -> links union-find -> events (dedup by id, validate) and clicks
-// -> group by person -> sessions, credit, assists -> two Parquet tables.
+// Shopping Sessions pipeline: rules.md in one Rust program.
+// read (mmap) -> links union-find -> events by event_id hash: dedup + validate -> by person hash:
+// sort, sessions, credit, assists -> two Parquet tables.
+// Speed: every string key is hashed once to 64 bits; every hash match is confirmed on the real bytes,
+// and a bucket that ever sees two different strings with one hash is redone with exact string keys.
 use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
+use std::collections::HashMap;
 use std::fs;
-use std::hash::Hasher;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 
 mod pq;
 
 const DAY: i64 = 86_400_000;
-const GAP: i64 = 1_800_000;
+const GAP: u32 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const NB: usize = 256; // hash buckets
-const CHUNK: usize = 2 << 20; // bytes per parse task
+const CHUNK: usize = 4 << 20; // bytes per parse task
 
-type B = &'static [u8];
+pub type B = &'static [u8];
+
+// identity hasher for keys that already are good 64-bit hashes
+#[derive(Default)]
+struct NoHash(u64);
+impl Hasher for NoHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!()
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n
+    }
+}
+type U64Map<V> = HashMap<u64, V, BuildHasherDefault<NoHash>>;
+
+#[inline]
+fn hash(b: &[u8]) -> u64 {
+    let mut h = FxHasher::default();
+    h.write(b);
+    let x = h.finish();
+    // finalizer so every bit range is well mixed (buckets use bits 40..48, the map uses low and top bits)
+    let x = (x ^ (x >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+    x ^ (x >> 29)
+}
+
+#[inline]
+fn bucket(h: u64) -> usize {
+    (h >> 40) as usize & (NB - 1)
+}
 
 // ---------- input files ----------
 
@@ -47,7 +81,7 @@ fn map_file(p: &Path) -> B {
     &m[..]
 }
 
-/// Body of a CSV file (after the header line), split into chunks that end on line boundaries.
+/// Bodies of CSV files (after the header line), split into chunks that end on line boundaries.
 fn chunks_of(files: &[PathBuf]) -> Vec<B> {
     let mut out = Vec::new();
     for p in files {
@@ -85,40 +119,42 @@ fn for_lines(chunk: B, mut f: impl FnMut(B)) {
     }
 }
 
+#[inline(always)]
+fn unquote(f: B, quotes: u32) -> Option<B> {
+    if quotes == 0 {
+        Some(f)
+    } else if quotes == 2 && f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+        Some(&f[1..f.len() - 1])
+    } else {
+        None
+    }
+}
+
 /// Split a line into exactly N fields following the CSV dialect; None if malformed.
-#[inline]
+#[inline(always)]
 fn fields<const N: usize>(line: B) -> Option<[B; N]> {
     let mut out: [B; N] = [&[]; N];
     let mut n = 0;
     let mut s = 0;
-    let len = line.len();
-    loop {
-        let e = match memchr::memchr(b',', &line[s..]) {
-            Some(i) => s + i,
-            None => len,
-        };
-        if n == N {
-            return None;
-        }
-        let f = &line[s..e];
-        out[n] = if f.first() == Some(&b'"') {
-            if f.len() < 2 || f[f.len() - 1] != b'"' || memchr::memchr(b'"', &f[1..f.len() - 1]).is_some() {
+    let mut q = 0u32;
+    for (i, &c) in line.iter().enumerate() {
+        if c == b',' {
+            if n + 1 >= N {
                 return None;
             }
-            &f[1..f.len() - 1]
-        } else {
-            if memchr::memchr(b'"', f).is_some() {
-                return None;
-            }
-            f
-        };
-        n += 1;
-        if e == len {
-            break;
+            out[n] = unquote(&line[s..i], q)?;
+            n += 1;
+            s = i + 1;
+            q = 0;
+        } else if c == b'"' {
+            q += 1;
         }
-        s = e + 1;
     }
-    if n == N { Some(out) } else { None }
+    if n + 1 != N {
+        return None;
+    }
+    out[n] = unquote(&line[s..], q)?;
+    Some(out)
 }
 
 // ---------- timestamps ----------
@@ -153,8 +189,7 @@ fn parse_ts(f: &[u8]) -> Option<i64> {
     if (n == 20 || n == 25) && f[4] == b'-' {
         return parse_iso(f);
     }
-    // F3: digits only
-    let mut v: i64 = 0;
+    let mut v: i64 = 0; // F3: digits only
     for &c in f {
         let d = c.wrapping_sub(b'0');
         if d >= 10 {
@@ -217,65 +252,79 @@ fn parse_iso(f: &[u8]) -> Option<i64> {
     Some(t)
 }
 
-#[inline]
-fn hash(b: &[u8]) -> u64 {
-    let mut h = FxHasher::default();
-    h.write(b);
-    h.finish()
-}
-
-#[inline]
-fn bucket(h: u64) -> usize {
-    (h >> 56) as usize % NB
-}
-
 // ---------- records ----------
 
+/// A parsed event line, before dedup. `line` lets us re-read the id and user only when needed.
 #[derive(Clone, Copy)]
 struct Ev {
+    idh: u64,
+    ph: u64,
     id: B,
-    user: B,
-    ts: i64,
+    name: B,
     ingest: i64,
-    price: u32, // 0 unless a valid purchase
+    ts: u32, // ms since base (window_start - 7 days)
+    price: u32,
     cat: u16,
     ok: bool,
 }
 
+/// A surviving event, keyed by person.
 #[derive(Clone, Copy)]
 struct PEv {
+    ph: u64,
     name: B,
-    ts: i64,
+    ts: u32,
     price: u32,
     cat: u16,
 }
 
 #[derive(Clone, Copy)]
 struct PCl {
+    ph: u64,
     name: B,
     id: B,
-    ts: i64,
+    ts: u32,
     camp: u16,
 }
 
+enum LinkMap {
+    Fast(U64Map<u32>),
+    Exact(FxHashMap<B, u32>),
+}
+
+struct Links {
+    map: LinkMap,
+    ids: Vec<B>,
+    names: Vec<B>,
+    name_h: Vec<u64>,
+}
+
+impl Links {
+    /// (person hash, person name) for a user id whose hash is `h`.
+    #[inline]
+    fn person(&self, user: B, h: u64) -> (u64, B) {
+        let i = match &self.map {
+            LinkMap::Fast(m) => match m.get(&h) {
+                Some(&i) if self.ids[i as usize] == user => Some(i),
+                _ => None,
+            },
+            LinkMap::Exact(m) => m.get(user).copied(),
+        };
+        match i {
+            Some(i) => (self.name_h[i as usize], self.names[i as usize]),
+            None => (h, user),
+        }
+    }
+}
+
 struct Ctx {
+    base: i64,
     ws: i64,
     we: i64,
     products: FxHashMap<B, u16>,
     unknown_cat: u16,
     camps: FxHashMap<B, u16>,
-    link_idx: FxHashMap<B, u32>,
-    link_name: Vec<B>,
-}
-
-impl Ctx {
-    #[inline]
-    fn person(&self, user: B) -> B {
-        match self.link_idx.get(user) {
-            Some(&i) => self.link_name[i as usize],
-            None => user,
-        }
-    }
+    links: Links,
 }
 
 fn parse_price(p: &[u8]) -> Option<u32> {
@@ -296,13 +345,14 @@ fn parse_price(p: &[u8]) -> Option<u32> {
     if v >= 1 { Some(v as u32) } else { None }
 }
 
+#[inline]
 fn parse_event(line: B, cx: &Ctx) -> Option<Ev> {
     let [id, user, ts, ingest, typ, product, price] = fields::<7>(line)?;
     if id.is_empty() {
         return None;
     }
     let ingest = parse_ts(ingest).unwrap_or(i64::MAX);
-    let mut e = Ev { id, user, ts: 0, ingest, price: 0, cat: 0, ok: false };
+    let mut e = Ev { idh: hash(id), ph: 0, id, name: &[], ingest, ts: 0, price: 0, cat: 0, ok: false };
     if user.is_empty() || product.is_empty() {
         return Some(e);
     }
@@ -324,22 +374,25 @@ fn parse_event(line: B, cx: &Ctx) -> Option<Ev> {
     if ingest - t > DAY {
         return Some(e);
     }
-    e.ts = t;
+    e.ts = (t - cx.base) as u32;
     e.ok = true;
+    (e.ph, e.name) = cx.links.person(user, hash(user));
     Some(e)
 }
 
+#[inline]
 fn parse_click(line: B, cx: &Ctx) -> Option<PCl> {
     let [id, user, camp, ts] = fields::<4>(line)?;
     if id.is_empty() || user.is_empty() {
         return None;
     }
     let t = parse_ts(ts)?;
-    if t < cx.ws - WEEK || t >= cx.we {
+    if t < cx.base || t >= cx.we {
         return None;
     }
     let c = *cx.camps.get(camp)?;
-    Some(PCl { name: cx.person(user), id, ts: t, camp: c })
+    let (ph, name) = cx.links.person(user, hash(user));
+    Some(PCl { ph, name, id, ts: (t - cx.base) as u32, camp: c })
 }
 
 // ---------- links ----------
@@ -353,41 +406,75 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-fn build_links(chunks: &[B]) -> (FxHashMap<B, u32>, Vec<B>) {
-    let pairs: Vec<Vec<(B, B)>> = chunks
+fn build_links(chunks: &[B]) -> Links {
+    let pairs: Vec<Vec<(u64, B, u64, B)>> = chunks
         .par_iter()
         .map(|c| {
-            let mut v = Vec::new();
+            let mut v = Vec::with_capacity(c.len() / 20);
             for_lines(c, |l| {
                 if let Some([a, b]) = fields::<2>(l) {
                     if !a.is_empty() && !b.is_empty() && a != b {
-                        v.push((a, b));
+                        v.push((hash(a), a, hash(b), b));
                     }
                 }
             });
             v
         })
         .collect();
-    let mut idx: FxHashMap<B, u32> = FxHashMap::default();
-    let mut ids: Vec<B> = Vec::new();
-    let mut par: Vec<u32> = Vec::new();
-    let intern = |s: B, idx: &mut FxHashMap<B, u32>, ids: &mut Vec<B>, par: &mut Vec<u32>| -> u32 {
-        *idx.entry(s).or_insert_with(|| {
+    let total: usize = pairs.iter().map(|v| v.len()).sum();
+    let mut fast: U64Map<u32> = U64Map::with_capacity_and_hasher(total, Default::default());
+    let mut ids: Vec<B> = Vec::with_capacity(total);
+    let mut par: Vec<u32> = Vec::with_capacity(total);
+    let mut collided = false;
+    let mut intern = |h: u64, s: B, ids: &mut Vec<B>, par: &mut Vec<u32>| -> u32 {
+        let i = *fast.entry(h).or_insert_with(|| {
             ids.push(s);
             par.push(par.len() as u32);
             (ids.len() - 1) as u32
-        })
+        });
+        if ids[i as usize] != s {
+            collided = true;
+        }
+        i
     };
     for v in &pairs {
-        for &(a, b) in v {
-            let ia = intern(a, &mut idx, &mut ids, &mut par);
-            let ib = intern(b, &mut idx, &mut ids, &mut par);
+        for &(ha, a, hb, b) in v {
+            let ia = intern(ha, a, &mut ids, &mut par);
+            let ib = intern(hb, b, &mut ids, &mut par);
             let (ra, rb) = (find(&mut par, ia), find(&mut par, ib));
             if ra != rb {
                 par[ra.max(rb) as usize] = ra.min(rb);
             }
         }
     }
+    if collided {
+        // two different ids share a 64-bit hash: redo with exact string keys
+        eprintln!("links: hash collision, exact mode");
+        let mut exact: FxHashMap<B, u32> = FxHashMap::default();
+        ids.clear();
+        par.clear();
+        for v in &pairs {
+            for &(_, a, _, b) in v {
+                let mut get = |s: B| {
+                    *exact.entry(s).or_insert_with(|| {
+                        ids.push(s);
+                        par.push(par.len() as u32);
+                        (ids.len() - 1) as u32
+                    })
+                };
+                let (ia, ib) = (get(a), get(b));
+                let (ra, rb) = (find(&mut par, ia), find(&mut par, ib));
+                if ra != rb {
+                    par[ra.max(rb) as usize] = ra.min(rb);
+                }
+            }
+        }
+        return finish_links(LinkMap::Exact(exact), ids, par);
+    }
+    finish_links(LinkMap::Fast(fast), ids, par)
+}
+
+fn finish_links(map: LinkMap, ids: Vec<B>, mut par: Vec<u32>) -> Links {
     let n = ids.len();
     let mut best: Vec<B> = ids.clone();
     for i in 0..n {
@@ -396,8 +483,15 @@ fn build_links(chunks: &[B]) -> (FxHashMap<B, u32>, Vec<B>) {
             best[r] = ids[i];
         }
     }
+    let mut root_h: Vec<u64> = vec![0; n];
+    for i in 0..n {
+        if par[i] as usize == i {
+            root_h[i] = hash(best[i]);
+        }
+    }
     let names: Vec<B> = (0..n).map(|i| best[par[i] as usize]).collect();
-    (idx, names)
+    let name_h: Vec<u64> = (0..n).map(|i| root_h[par[i] as usize]).collect();
+    Links { map, ids, names, name_h }
 }
 
 // ---------- small inputs ----------
@@ -422,6 +516,45 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     parse_ts(rest[a..b].as_bytes()).expect("manifest ts")
 }
 
+// ---------- dedup ----------
+
+/// Keep, per event id, the copy with the smallest ingest_ts; return the kept copies that are valid.
+fn dedup(recs: &[Ev], exact: bool) -> Option<Vec<usize>> {
+    let mut keep = Vec::with_capacity(recs.len());
+    if exact {
+        let mut m: FxHashMap<B, usize> = FxHashMap::default();
+        for (k, e) in recs.iter().enumerate() {
+            m.entry(e.id).and_modify(|j| {
+                if e.ingest < recs[*j].ingest {
+                    *j = k
+                }
+            })
+            .or_insert(k);
+        }
+        keep.extend(m.values().copied().filter(|&k| recs[k].ok));
+        return Some(keep);
+    }
+    let mut m: U64Map<u32> = U64Map::with_capacity_and_hasher(recs.len(), Default::default());
+    for (k, e) in recs.iter().enumerate() {
+        match m.entry(e.idh) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(k as u32);
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let j = *o.get() as usize;
+                if e.id != recs[j].id {
+                    return None; // hash collision between two different ids
+                }
+                if e.ingest < recs[j].ingest {
+                    o.insert(k as u32);
+                }
+            }
+        }
+    }
+    keep.extend(m.values().map(|&k| k as usize).filter(|&k| recs[k].ok));
+    Some(keep)
+}
+
 // ---------- per-person work ----------
 
 pub struct Acc {
@@ -438,7 +571,7 @@ pub struct Acc {
     pub u_events: Vec<i64>,
     pub u_rev: Vec<i64>,
     pub u_top: Vec<Option<u16>>,
-    // scratch for assists and top category
+    // scratch
     cnt: Vec<u32>,
     active: Vec<u16>,
     pos: Vec<u32>,
@@ -468,6 +601,13 @@ impl Acc {
     }
 }
 
+struct Shared<'a> {
+    ncamp: usize,
+    day0: i64, // first window day, in days since epoch
+    base: i64,
+    cat_rank: &'a [u32],
+}
+
 struct DayAgg {
     day: i64,
     sessions: i64,
@@ -492,21 +632,10 @@ fn flush_day(acc: &mut Acc, name: B, da: &DayAgg, cat_rank: &[u32]) {
     acc.catsum.clear();
 }
 
-fn add_cat(acc: &mut Acc, c: u16, p: u32) {
-    for e in acc.catsum.iter_mut() {
-        if e.0 == c {
-            e.1 += p as u64;
-            return;
-        }
-    }
-    acc.catsum.push((c, p as u64));
-}
-
-fn process_person(acc: &mut Acc, name: B, evs: &mut [PEv], cls: &mut [PCl], day0: i64, ncamp: usize, cat_rank: &[u32]) {
-    evs.sort_unstable_by_key(|e| e.ts);
-    // ts ascending, id descending: the last click with ts <= start is the latest, smallest id
-    cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(a.id)));
+/// One person: events sorted by ts, clicks sorted by (ts asc, id desc).
+fn process_person(acc: &mut Acc, sh: &Shared, name: B, evs: &[PEv], cls: &[PCl]) {
     let nd = acc.nd;
+    let week = WEEK as u32;
     let (mut ci, mut cj) = (0usize, 0usize); // click window [ci, cj)
     let mut cur: Option<DayAgg> = None;
     let mut i = 0;
@@ -514,22 +643,26 @@ fn process_person(acc: &mut Acc, name: B, evs: &mut [PEv], cls: &mut [PCl], day0
         let start = evs[i].ts;
         let mut last = start;
         let mut j = i;
+        let mut rev: u64 = 0;
         while j < evs.len() && evs[j].ts - last <= GAP {
             last = evs[j].ts;
             j += 1;
         }
-        let day = start.div_euclid(DAY);
+        let day = (sh.base + start as i64).div_euclid(DAY);
         if cur.as_ref().map(|c| c.day) != Some(day) {
             if let Some(c) = cur.take() {
-                flush_day(acc, name, &c, cat_rank);
+                flush_day(acc, name, &c, sh.cat_rank);
             }
             cur = Some(DayAgg { day, sessions: 0, events: 0, rev: 0 });
         }
-        let mut rev: u64 = 0;
         for e in &evs[i..j] {
             if e.price > 0 {
                 rev += e.price as u64;
-                add_cat(acc, e.cat, e.price);
+                let p = e.price as u64;
+                match acc.catsum.iter_mut().find(|x| x.0 == e.cat) {
+                    Some(x) => x.1 += p,
+                    None => acc.catsum.push((e.cat, p)),
+                }
             }
         }
         {
@@ -547,7 +680,8 @@ fn process_person(acc: &mut Acc, name: B, evs: &mut [PEv], cls: &mut [PCl], day0
             acc.cnt[c] += 1;
             cj += 1;
         }
-        while ci < cj && cls[ci].ts < start - WEEK {
+        // start >= week always (start is in the window, base is 7 days earlier)
+        while ci < cj && cls[ci].ts < start - week {
             let c = cls[ci].camp as usize;
             acc.cnt[c] -= 1;
             if acc.cnt[c] == 0 {
@@ -559,8 +693,8 @@ fn process_person(acc: &mut Acc, name: B, evs: &mut [PEv], cls: &mut [PCl], day0
             }
             ci += 1;
         }
-        let d = (day - day0) as usize;
-        let credited = if cj > ci { cls[cj - 1].camp as usize } else { ncamp };
+        let d = (day - sh.day0) as usize;
+        let credited = if cj > ci { cls[cj - 1].camp as usize } else { sh.ncamp };
         let cell = credited * nd + d;
         acc.sess[cell] += 1;
         acc.rev[cell] += rev;
@@ -568,18 +702,65 @@ fn process_person(acc: &mut Acc, name: B, evs: &mut [PEv], cls: &mut [PCl], day0
             acc.purch[cell] += 1;
         }
         for k in 0..acc.active.len() {
-            let a = acc.active[k] as usize;
-            acc.assist[a * nd + d] += 1;
+            acc.assist[acc.active[k] as usize * nd + d] += 1;
         }
         i = j;
     }
     if let Some(c) = cur.take() {
-        flush_day(acc, name, &c, cat_rank);
+        flush_day(acc, name, &c, sh.cat_rank);
     }
     for k in 0..acc.active.len() {
         acc.cnt[acc.active[k] as usize] = 0;
     }
     acc.active.clear();
+}
+
+/// All persons of one bucket. Fast mode groups by person hash and checks the names;
+/// returns false (nothing written) if two names share a hash, and exact mode is used instead.
+fn process_bucket(acc: &mut Acc, sh: &Shared, evs: &mut [PEv], cls: &mut [PCl], exact: bool) -> bool {
+    if exact {
+        evs.sort_unstable_by(|a, b| (a.ph, a.name, a.ts).cmp(&(b.ph, b.name, b.ts)));
+        cls.sort_unstable_by(|a, b| (a.ph, a.name, a.ts).cmp(&(b.ph, b.name, b.ts)).then_with(|| b.id.cmp(a.id)));
+    } else {
+        evs.sort_unstable_by_key(|e| (e.ph, e.ts));
+        cls.sort_unstable_by(|a, b| (a.ph, a.ts).cmp(&(b.ph, b.ts)).then_with(|| b.id.cmp(a.id)));
+        // verify: one name per hash
+        for w in evs.windows(2) {
+            if w[0].ph == w[1].ph && w[0].name != w[1].name {
+                return false;
+            }
+        }
+        let mut i = 0;
+        for c in cls.iter() {
+            while i < evs.len() && evs[i].ph < c.ph {
+                i += 1;
+            }
+            if i < evs.len() && evs[i].ph == c.ph && evs[i].name != c.name {
+                return false;
+            }
+        }
+    }
+    let same = |a: (u64, B), b: (u64, B)| a.0 == b.0 && (!exact || a.1 == b.1);
+    let (mut i, mut k) = (0usize, 0usize);
+    while i < evs.len() {
+        let key = (evs[i].ph, evs[i].name);
+        let mut j = i + 1;
+        while j < evs.len() && same((evs[j].ph, evs[j].name), key) {
+            j += 1;
+        }
+        // skip clicks of persons with no surviving events (same order as the sort)
+        while k < cls.len() && (if exact { (cls[k].ph, cls[k].name) < key } else { cls[k].ph < key.0 }) {
+            k += 1;
+        }
+        let mut l = k;
+        while l < cls.len() && same((cls[l].ph, cls[l].name), key) {
+            l += 1;
+        }
+        process_person(acc, sh, key.1, &evs[i..j], &cls[k..l]);
+        k = l;
+        i = j;
+    }
+    true
 }
 
 fn main() {
@@ -589,6 +770,7 @@ fn main() {
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().ok();
     let t0 = std::time::Instant::now();
     let timing = std::env::var("SS_TIME").is_ok();
+    let force_exact = std::env::var("SS_EXACT").is_ok(); // test switch: always use exact string keys
     let lap = |s: &str| {
         if timing {
             eprintln!("{:>8.1} ms  {s}", t0.elapsed().as_secs_f64() * 1000.0)
@@ -637,61 +819,69 @@ fn main() {
     let ln_chunks = chunks_of(&csv_files(&data.join("links")));
     lap("mapped");
 
-    let (link_idx, link_name) = build_links(&ln_chunks);
+    let mut links = build_links(&ln_chunks);
+    if force_exact {
+        if let LinkMap::Fast(_) = links.map {
+            let mut m: FxHashMap<B, u32> = FxHashMap::default();
+            for (i, &s) in links.ids.iter().enumerate() {
+                m.insert(s, i as u32);
+            }
+            links.map = LinkMap::Exact(m);
+        }
+    }
     lap("links");
-    let cx = Ctx { ws, we, products, unknown_cat, camps, link_idx, link_name };
+    let base = ws - WEEK;
+    let cx = Ctx { base, ws, we, products, unknown_cat, camps, links };
 
-    // events: parse into buckets by event_id
+    // events: parse into buckets by event_id hash; clicks: into buckets by person hash
+    let est = |c: &B, line: usize| c.len() / line / NB + 16;
     let ev_parts: Vec<Vec<Vec<Ev>>> = ev_chunks
         .par_iter()
         .map(|c| {
-            let mut bk: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::new()).collect();
+            let mut bk: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(est(c, 60))).collect();
             for_lines(c, |l| {
                 if let Some(e) = parse_event(l, &cx) {
-                    bk[bucket(hash(e.id))].push(e);
+                    bk[bucket(e.idh)].push(e);
                 }
             });
             bk
         })
         .collect();
     lap("events parsed");
-    // clicks: parse into person buckets
     let cl_parts: Vec<Vec<Vec<PCl>>> = cl_chunks
         .par_iter()
         .map(|c| {
-            let mut bk: Vec<Vec<PCl>> = (0..NB).map(|_| Vec::new()).collect();
+            let mut bk: Vec<Vec<PCl>> = (0..NB).map(|_| Vec::with_capacity(est(c, 40))).collect();
             for_lines(c, |l| {
                 if let Some(k) = parse_click(l, &cx) {
-                    bk[bucket(hash(k.name))].push(k);
+                    bk[bucket(k.ph)].push(k);
                 }
             });
             bk
         })
         .collect();
     lap("clicks parsed");
-    // dedup events per id bucket (smallest ingest_ts wins), keep valid ones, route to person buckets
+
+    // dedup events per id bucket, route the valid kept copies to person buckets
     let pe_parts: Vec<Vec<Vec<PEv>>> = (0..NB)
         .into_par_iter()
         .map(|b| {
             let n: usize = ev_parts.iter().map(|p| p[b].len()).sum();
-            let mut best: FxHashMap<B, Ev> = FxHashMap::with_capacity_and_hasher(n, Default::default());
+            let mut recs: Vec<Ev> = Vec::with_capacity(n);
             for p in &ev_parts {
-                for &e in &p[b] {
-                    best.entry(e.id)
-                        .and_modify(|k| {
-                            if e.ingest < k.ingest {
-                                *k = e
-                            }
-                        })
-                        .or_insert(e);
-                }
+                recs.extend_from_slice(&p[b]);
             }
-            let mut bk: Vec<Vec<PEv>> = (0..NB).map(|_| Vec::new()).collect();
-            for e in best.values() {
-                if e.ok {
-                    let name = cx.person(e.user);
-                    bk[bucket(hash(name))].push(PEv { name, ts: e.ts, price: e.price, cat: e.cat });
+            let keep = match dedup(&recs, force_exact) {
+                Some(k) => k,
+                None => {
+                    eprintln!("dedup: hash collision in bucket {b}, exact mode");
+                    dedup(&recs, true).unwrap()
                 }
+            };
+            let mut bk: Vec<Vec<PEv>> = (0..NB).map(|_| Vec::with_capacity(keep.len() / NB + 16)).collect();
+            for k in keep {
+                let e = &recs[k];
+                bk[bucket(e.ph)].push(PEv { ph: e.ph, name: e.name, ts: e.ts, price: e.price, cat: e.cat });
             }
             bk
         })
@@ -701,34 +891,23 @@ fn main() {
 
     let day0 = ws.div_euclid(DAY);
     let nd = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
+    let sh = Shared { ncamp, day0, base, cat_rank: &cat_rank };
     let accs: Vec<Acc> = (0..NB)
         .into_par_iter()
         .fold(
             || Acc::new(ncamp, nd),
             |mut acc, b| {
-                let mut pidx: FxHashMap<B, u32> = FxHashMap::default();
-                let mut names: Vec<B> = Vec::new();
-                let mut evs: Vec<Vec<PEv>> = Vec::new();
+                let mut evs: Vec<PEv> = Vec::with_capacity(pe_parts.iter().map(|p| p[b].len()).sum());
                 for p in &pe_parts {
-                    for &e in &p[b] {
-                        let i = *pidx.entry(e.name).or_insert_with(|| {
-                            names.push(e.name);
-                            evs.push(Vec::new());
-                            (names.len() - 1) as u32
-                        });
-                        evs[i as usize].push(e);
-                    }
+                    evs.extend_from_slice(&p[b]);
                 }
-                let mut cls: Vec<Vec<PCl>> = (0..names.len()).map(|_| Vec::new()).collect();
+                let mut cls: Vec<PCl> = Vec::with_capacity(cl_parts.iter().map(|p| p[b].len()).sum());
                 for p in &cl_parts {
-                    for &k in &p[b] {
-                        if let Some(&i) = pidx.get(k.name) {
-                            cls[i as usize].push(k);
-                        }
-                    }
+                    cls.extend_from_slice(&p[b]);
                 }
-                for i in 0..names.len() {
-                    process_person(&mut acc, names[i], &mut evs[i], &mut cls[i], day0, ncamp, &cat_rank);
+                if !process_bucket(&mut acc, &sh, &mut evs, &mut cls, force_exact) {
+                    eprintln!("persons: hash collision in bucket {b}, exact mode");
+                    process_bucket(&mut acc, &sh, &mut evs, &mut cls, true);
                 }
                 acc
             },
