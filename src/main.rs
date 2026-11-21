@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 
 mod pq;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const DAY: i64 = 86_400_000;
 const GAP: u32 = 1_800_000;
 const WEEK: i64 = 7 * DAY;

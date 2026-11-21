@@ -38,7 +38,7 @@ fn props() -> Arc<WriterProperties> {
 }
 
 fn bytes(v: &[B]) -> Vec<ByteArray> {
-    v.iter().map(|s| ByteArray::from(*s)).collect()
+    v.iter().map(|s| ByteArray::from(bytes::Bytes::from_static(s))).collect()
 }
 
 fn write(path: &Path, schema: &str, cols: Vec<Col>) {
@@ -85,7 +85,7 @@ pub fn write_campaign(path: &Path, r: &CampaignRows) {
 
 pub fn write_user(path: &Path, a: &Acc, cat_names: &[B]) {
     let def: Vec<i16> = a.u_top.iter().map(|t| t.is_some() as i16).collect();
-    let tops: Vec<ByteArray> = a.u_top.iter().flatten().map(|&c| ByteArray::from(cat_names[c as usize])).collect();
+    let tops: Vec<ByteArray> = a.u_top.iter().flatten().map(|&c| ByteArray::from(bytes::Bytes::from_static(cat_names[c as usize]))).collect();
     write(
         path,
         "message user_daily { required binary user_id (STRING); required int32 day (DATE); \

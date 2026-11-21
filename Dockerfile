@@ -7,5 +7,7 @@ RUN cargo build --release && cp target/release/shopsess /shopsess
 
 FROM debian:bookworm-slim
 COPY --from=build /shopsess /app/shopsess
+# mimalloc: large OS pages when allowed, and keep freed memory for reuse between stages
+ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1 MIMALLOC_PURGE_DELAY=-1
 USER 1000:1000
 CMD ["/app/shopsess"]
