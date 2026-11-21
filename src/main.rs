@@ -47,6 +47,17 @@ fn hash(b: &[u8]) -> u64 {
     x ^ (x >> 29)
 }
 
+/// A second, independent hash: checks that equal first hashes really are equal strings.
+#[inline]
+fn hash2(b: &[u8]) -> u64 {
+    let mut h = FxHasher::default();
+    h.write_u64(0x9e37_79b9_7f4a_7c15);
+    h.write(b);
+    let x = h.finish().wrapping_add(b.len() as u64);
+    let x = (x ^ (x >> 31)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^ (x >> 32)
+}
+
 #[inline]
 fn bucket(h: u64) -> usize {
     (h >> 40) as usize & (NB - 1)
@@ -133,22 +144,47 @@ fn unquote(f: B, quotes: u32) -> Option<B> {
 /// Split a line into exactly N fields following the CSV dialect; None if malformed.
 #[inline(always)]
 fn fields<const N: usize>(line: B) -> Option<[B; N]> {
+    // 8 bytes at a time: flag bytes that may be ',' or '"' (the zero-byte trick can also flag a byte
+    // right above a real match, so every flagged byte is re-checked below; real matches are never missed)
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
     let mut out: [B; N] = [&[]; N];
     let mut n = 0;
     let mut s = 0;
     let mut q = 0u32;
-    for (i, &c) in line.iter().enumerate() {
-        if c == b',' {
-            if n + 1 >= N {
-                return None;
+    let len = line.len();
+    let mut i = 0;
+    macro_rules! byte {
+        ($pos:expr) => {{
+            let pos = $pos;
+            let c = line[pos];
+            if c == b',' {
+                if n + 1 >= N {
+                    return None;
+                }
+                out[n] = unquote(&line[s..pos], q)?;
+                n += 1;
+                s = pos + 1;
+                q = 0;
+            } else if c == b'"' {
+                q += 1;
             }
-            out[n] = unquote(&line[s..i], q)?;
-            n += 1;
-            s = i + 1;
-            q = 0;
-        } else if c == b'"' {
-            q += 1;
+        }};
+    }
+    while i + 8 <= len {
+        let w = u64::from_le_bytes(line[i..i + 8].try_into().unwrap());
+        let a = w ^ (ONES * b',' as u64);
+        let b = w ^ (ONES * b'"' as u64);
+        let mut m = ((a.wrapping_sub(ONES) & !a) | (b.wrapping_sub(ONES) & !b)) & HIGH;
+        while m != 0 {
+            byte!(i + (m.trailing_zeros() / 8) as usize);
+            m &= m - 1;
         }
+        i += 8;
+    }
+    while i < len {
+        byte!(i);
+        i += 1;
     }
     if n + 1 != N {
         return None;
@@ -259,6 +295,7 @@ fn parse_iso(f: &[u8]) -> Option<i64> {
 struct Ev {
     idh: u64,
     ph: u64,
+    ph2: u32,
     id: B,
     name: B,
     ingest: i64,
@@ -272,6 +309,7 @@ struct Ev {
 #[derive(Clone, Copy)]
 struct PEv {
     ph: u64,
+    ph2: u32,
     name: B,
     ts: u32,
     price: u32,
@@ -281,38 +319,40 @@ struct PEv {
 #[derive(Clone, Copy)]
 struct PCl {
     ph: u64,
+    ph2: u32,
     name: B,
     id: B,
     ts: u32,
     camp: u16,
 }
 
-enum LinkMap {
-    Fast(U64Map<u32>),
-    Exact(FxHashMap<B, u32>),
+/// What a lookup of a linked id needs, in one table slot: a second hash of the id (the check),
+/// and the person's name with its two hashes.
+#[derive(Clone, Copy)]
+struct LinkVal {
+    h2: u64,
+    nh: u64,
+    nh2: u32,
+    name: B,
 }
 
-struct Links {
-    map: LinkMap,
-    ids: Vec<B>,
-    names: Vec<B>,
-    name_h: Vec<u64>,
+enum Links {
+    Fast(U64Map<LinkVal>),
+    Exact(FxHashMap<B, LinkVal>),
 }
 
 impl Links {
-    /// (person hash, person name) for a user id whose hash is `h`.
+    /// (person hash, second person hash, person name) for a user id whose hash is `h`.
     #[inline]
-    fn person(&self, user: B, h: u64) -> (u64, B) {
-        let i = match &self.map {
-            LinkMap::Fast(m) => match m.get(&h) {
-                Some(&i) if self.ids[i as usize] == user => Some(i),
-                _ => None,
-            },
-            LinkMap::Exact(m) => m.get(user).copied(),
+    fn person(&self, user: B, h: u64) -> (u64, u32, B) {
+        let h2 = hash2(user);
+        let v = match self {
+            Links::Fast(m) => m.get(&h).filter(|v| v.h2 == h2),
+            Links::Exact(m) => m.get(user),
         };
-        match i {
-            Some(i) => (self.name_h[i as usize], self.names[i as usize]),
-            None => (h, user),
+        match v {
+            Some(v) => (v.nh, v.nh2, v.name),
+            None => (h, h2 as u32, user),
         }
     }
 }
@@ -352,7 +392,7 @@ fn parse_event(line: B, cx: &Ctx) -> Option<Ev> {
         return None;
     }
     let ingest = parse_ts(ingest).unwrap_or(i64::MAX);
-    let mut e = Ev { idh: hash(id), ph: 0, id, name: &[], ingest, ts: 0, price: 0, cat: 0, ok: false };
+    let mut e = Ev { idh: hash(id), ph: 0, ph2: 0, id, name: &[], ingest, ts: 0, price: 0, cat: 0, ok: false };
     if user.is_empty() || product.is_empty() {
         return Some(e);
     }
@@ -376,7 +416,7 @@ fn parse_event(line: B, cx: &Ctx) -> Option<Ev> {
     }
     e.ts = (t - cx.base) as u32;
     e.ok = true;
-    (e.ph, e.name) = cx.links.person(user, hash(user));
+    (e.ph, e.ph2, e.name) = cx.links.person(user, hash(user));
     Some(e)
 }
 
@@ -391,8 +431,8 @@ fn parse_click(line: B, cx: &Ctx) -> Option<PCl> {
         return None;
     }
     let c = *cx.camps.get(camp)?;
-    let (ph, name) = cx.links.person(user, hash(user));
-    Some(PCl { ph, name, id, ts: (t - cx.base) as u32, camp: c })
+    let (ph, ph2, name) = cx.links.person(user, hash(user));
+    Some(PCl { ph, ph2, name, id, ts: (t - cx.base) as u32, camp: c })
 }
 
 // ---------- links ----------
@@ -406,75 +446,43 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-fn build_links(chunks: &[B]) -> Links {
-    let pairs: Vec<Vec<(u64, B, u64, B)>> = chunks
+fn build_links(chunks: &[B], force_exact: bool) -> Links {
+    let pairs: Vec<Vec<(B, B)>> = chunks
         .par_iter()
         .map(|c| {
             let mut v = Vec::with_capacity(c.len() / 20);
             for_lines(c, |l| {
                 if let Some([a, b]) = fields::<2>(l) {
                     if !a.is_empty() && !b.is_empty() && a != b {
-                        v.push((hash(a), a, hash(b), b));
+                        v.push((a, b));
                     }
                 }
             });
             v
         })
         .collect();
+    // union-find over interned ids (exact string keys; links are a small share of the data)
     let total: usize = pairs.iter().map(|v| v.len()).sum();
-    let mut fast: U64Map<u32> = U64Map::with_capacity_and_hasher(total, Default::default());
+    let mut idx: FxHashMap<B, u32> = FxHashMap::with_capacity_and_hasher(total, Default::default());
     let mut ids: Vec<B> = Vec::with_capacity(total);
     let mut par: Vec<u32> = Vec::with_capacity(total);
-    let mut collided = false;
-    let mut intern = |h: u64, s: B, ids: &mut Vec<B>, par: &mut Vec<u32>| -> u32 {
-        let i = *fast.entry(h).or_insert_with(|| {
-            ids.push(s);
-            par.push(par.len() as u32);
-            (ids.len() - 1) as u32
-        });
-        if ids[i as usize] != s {
-            collided = true;
-        }
-        i
-    };
     for v in &pairs {
-        for &(ha, a, hb, b) in v {
-            let ia = intern(ha, a, &mut ids, &mut par);
-            let ib = intern(hb, b, &mut ids, &mut par);
+        for &(a, b) in v {
+            let mut get = |s: B| {
+                *idx.entry(s).or_insert_with(|| {
+                    ids.push(s);
+                    par.push(par.len() as u32);
+                    (ids.len() - 1) as u32
+                })
+            };
+            let (ia, ib) = (get(a), get(b));
             let (ra, rb) = (find(&mut par, ia), find(&mut par, ib));
             if ra != rb {
                 par[ra.max(rb) as usize] = ra.min(rb);
             }
         }
     }
-    if collided {
-        // two different ids share a 64-bit hash: redo with exact string keys
-        eprintln!("links: hash collision, exact mode");
-        let mut exact: FxHashMap<B, u32> = FxHashMap::default();
-        ids.clear();
-        par.clear();
-        for v in &pairs {
-            for &(_, a, _, b) in v {
-                let mut get = |s: B| {
-                    *exact.entry(s).or_insert_with(|| {
-                        ids.push(s);
-                        par.push(par.len() as u32);
-                        (ids.len() - 1) as u32
-                    })
-                };
-                let (ia, ib) = (get(a), get(b));
-                let (ra, rb) = (find(&mut par, ia), find(&mut par, ib));
-                if ra != rb {
-                    par[ra.max(rb) as usize] = ra.min(rb);
-                }
-            }
-        }
-        return finish_links(LinkMap::Exact(exact), ids, par);
-    }
-    finish_links(LinkMap::Fast(fast), ids, par)
-}
-
-fn finish_links(map: LinkMap, ids: Vec<B>, mut par: Vec<u32>) -> Links {
+    drop(idx);
     let n = ids.len();
     let mut best: Vec<B> = ids.clone();
     for i in 0..n {
@@ -483,15 +491,35 @@ fn finish_links(map: LinkMap, ids: Vec<B>, mut par: Vec<u32>) -> Links {
             best[r] = ids[i];
         }
     }
-    let mut root_h: Vec<u64> = vec![0; n];
+    let mut root: Vec<(u64, u32)> = vec![(0, 0); n];
     for i in 0..n {
         if par[i] as usize == i {
-            root_h[i] = hash(best[i]);
+            root[i] = (hash(best[i]), hash2(best[i]) as u32);
         }
     }
-    let names: Vec<B> = (0..n).map(|i| best[par[i] as usize]).collect();
-    let name_h: Vec<u64> = (0..n).map(|i| root_h[par[i] as usize]).collect();
-    Links { map, ids, names, name_h }
+    let val = |i: usize| {
+        let r = par[i] as usize;
+        LinkVal { h2: hash2(ids[i]), nh: root[r].0, nh2: root[r].1, name: best[r] }
+    };
+    if !force_exact {
+        let mut m: U64Map<LinkVal> = U64Map::with_capacity_and_hasher(n, Default::default());
+        let mut ok = true;
+        for i in 0..n {
+            if m.insert(hash(ids[i]), val(i)).is_some() {
+                ok = false; // two link ids share a 64-bit hash
+                break;
+            }
+        }
+        if ok {
+            return Links::Fast(m);
+        }
+        eprintln!("links: hash collision, exact mode");
+    }
+    let mut m: FxHashMap<B, LinkVal> = FxHashMap::with_capacity_and_hasher(n, Default::default());
+    for i in 0..n {
+        m.insert(ids[i], val(i));
+    }
+    Links::Exact(m)
 }
 
 // ---------- small inputs ----------
@@ -519,7 +547,7 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 // ---------- dedup ----------
 
 /// Keep, per event id, the copy with the smallest ingest_ts; return the kept copies that are valid.
-fn dedup(recs: &[Ev], exact: bool) -> Option<Vec<usize>> {
+fn dedup(recs: &[&Ev], exact: bool) -> Option<Vec<usize>> {
     let mut keep = Vec::with_capacity(recs.len());
     if exact {
         let mut m: FxHashMap<B, usize> = FxHashMap::default();
@@ -726,7 +754,7 @@ fn process_bucket(acc: &mut Acc, sh: &Shared, evs: &mut [PEv], cls: &mut [PCl], 
         cls.sort_unstable_by(|a, b| (a.ph, a.ts).cmp(&(b.ph, b.ts)).then_with(|| b.id.cmp(a.id)));
         // verify: one name per hash
         for w in evs.windows(2) {
-            if w[0].ph == w[1].ph && w[0].name != w[1].name {
+            if w[0].ph == w[1].ph && w[0].ph2 != w[1].ph2 {
                 return false;
             }
         }
@@ -735,7 +763,7 @@ fn process_bucket(acc: &mut Acc, sh: &Shared, evs: &mut [PEv], cls: &mut [PCl], 
             while i < evs.len() && evs[i].ph < c.ph {
                 i += 1;
             }
-            if i < evs.len() && evs[i].ph == c.ph && evs[i].name != c.name {
+            if i < evs.len() && evs[i].ph == c.ph && evs[i].ph2 != c.ph2 {
                 return false;
             }
         }
@@ -819,16 +847,7 @@ fn main() {
     let ln_chunks = chunks_of(&csv_files(&data.join("links")));
     lap("mapped");
 
-    let mut links = build_links(&ln_chunks);
-    if force_exact {
-        if let LinkMap::Fast(_) = links.map {
-            let mut m: FxHashMap<B, u32> = FxHashMap::default();
-            for (i, &s) in links.ids.iter().enumerate() {
-                m.insert(s, i as u32);
-            }
-            links.map = LinkMap::Exact(m);
-        }
-    }
+    let links = build_links(&ln_chunks, force_exact);
     lap("links");
     let base = ws - WEEK;
     let cx = Ctx { base, ws, we, products, unknown_cat, camps, links };
@@ -867,9 +886,9 @@ fn main() {
         .into_par_iter()
         .map(|b| {
             let n: usize = ev_parts.iter().map(|p| p[b].len()).sum();
-            let mut recs: Vec<Ev> = Vec::with_capacity(n);
+            let mut recs: Vec<&Ev> = Vec::with_capacity(n);
             for p in &ev_parts {
-                recs.extend_from_slice(&p[b]);
+                recs.extend(p[b].iter());
             }
             let keep = match dedup(&recs, force_exact) {
                 Some(k) => k,
@@ -881,7 +900,7 @@ fn main() {
             let mut bk: Vec<Vec<PEv>> = (0..NB).map(|_| Vec::with_capacity(keep.len() / NB + 16)).collect();
             for k in keep {
                 let e = &recs[k];
-                bk[bucket(e.ph)].push(PEv { ph: e.ph, name: e.name, ts: e.ts, price: e.price, cat: e.cat });
+                bk[bucket(e.ph)].push(PEv { ph: e.ph, ph2: e.ph2, name: e.name, ts: e.ts, price: e.price, cat: e.cat });
             }
             bk
         })
